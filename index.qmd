@@ -1,0 +1,459 @@
+---
+title: "TEXAS-CRASHES Analysis"
+subtitle: "Centered Walkability with Quadratic Term"
+author: "Eric Delmelle | Lehigh University"
+date: "October 2, 2025"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+    embed-resources: true
+    fig-width: 8
+    fig-height: 6
+---
+
+
+# Introduction
+
+This analysis examines the relationship between walkability and traffic crash counts across Texas census tracts, stratified by Rural-Urban Commuting Area (RUCA) classifications. 
+
+Key objectives:
+
+- Test whether the walkability-crash relationship varies between metropolitan, micropolitan, small rural, and isolated rural areas
+- Account for population density and demographic composition (percent white, percent in poverty)
+- Use population as an exposure offset
+- Include both linear and quadratic walkability terms to capture potential non-linear relationships
+
+# 1. Setup and Data Loading
+
+## 1.1 Required Packages
+
+```{r libraries}
+required_packages <- c("MASS", "dplyr", "broom", "ggplot2", "sf", "readr", 
+                       "purrr", "knitr", "kableExtra", "ggeffects", "spdep", 
+                       "tigris")
+
+missing_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages)) {
+  install.packages(missing_packages)
+}
+
+suppressPackageStartupMessages({
+  library(MASS)
+  library(dplyr)
+  library(broom)
+  library(ggplot2)
+  library(sf)
+  library(readr)
+  library(purrr)
+  library(knitr)
+  library(kableExtra)
+  library(ggeffects)
+  library(spdep)
+  library(tigris)
+})
+```
+
+## 1.2 Load Spatial and Crash Data
+
+Load crash data and geographic data, then join based on GEOID.
+
+```{r load-data}
+shape_data <- st_read("data.shp", quiet = TRUE) %>% 
+  mutate(GEOID = as.character(GEOID))
+
+crash_counts <- read_csv("countcrashes.csv", 
+                        col_types = cols(Count_crash = col_double(), 
+                                       GEOID = col_character()))
+
+full_data <- left_join(shape_data, crash_counts, by = "GEOID")
+```
+
+# 2. Data Preprocessing
+
+Filter invalid observations and create analysis variables:
+
+- Population density capped at 99th percentile to reduce outlier influence
+- Demographic variables standardized for interpretation
+- Walkability index centered (not scaled) to preserve original units while facilitating quadratic term interpretation
+
+```{r preprocess}
+f_model <- full_data %>%
+  st_drop_geometry() %>%
+  filter(
+    Population > 0,
+    Count_crash >= 0,
+    !is.na(RUCA_2),
+    LA_sqmi > 0,
+    !is.na(NatWalkInd),
+    !is.na(Perc_White),
+    !is.na(PercPOV)
+  ) %>%
+  mutate(
+    popden = pmin(Population / LA_sqmi, quantile(Population / LA_sqmi, 0.99, na.rm = TRUE)),
+    pct_white = scale(Perc_White / 100)[,1],
+    pct_pov = scale(pmin(PercPOV / 100, 0.8))[,1],
+    log_offset = log(Population),
+    NatWalkInd_c = scale(NatWalkInd, scale = FALSE)[,1],
+    RUCA_group = case_when(
+      RUCA_2 %in% c(1.0, 1.1, 2.0, 2.1, 3.0, 4.1, 5.1, 7.1, 8.1, 10.1) ~ "Metropolitan",
+      RUCA_2 %in% c(4.0, 4.2, 5.0, 5.2, 6.0, 6.1) ~ "Micropolitan", 
+      RUCA_2 %in% c(7.0, 7.2, 7.3, 7.4, 8.0, 8.2, 8.3, 8.4, 9.0, 9.1, 9.2) ~ "Small Rural",
+      RUCA_2 %in% c(10.0, 10.2, 10.3, 10.4, 10.5, 10.6) ~ "Isolated Rural",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(RUCA_group),
+    across(c(NatWalkInd_c, popden, pct_white, pct_pov, log_offset), 
+           ~ is.finite(.) & !is.na(.))
+  )
+```
+
+# 3. Model Fitting
+
+## 3.1 Fitting Strategy
+
+Fit negative binomial regression models separately for each RUCA group. If convergence fails (typically due to extreme zero-inflation), fall back to Poisson.
+
+```{r fit-models}
+fit_model <- function(df) {
+  # Try negative binomial first
+  model <- tryCatch(
+    glm.nb(Count_crash ~ NatWalkInd_c + I(NatWalkInd_c^2) + 
+           popden + pct_white + pct_pov + offset(log_offset), data = df),
+    error = function(e) NULL
+  )
+  
+  # Fall back to Poisson if needed
+  if (is.null(model) || !model$converged) {
+    model <- tryCatch(
+      glm(Count_crash ~ NatWalkInd_c + I(NatWalkInd_c^2) + 
+          popden + pct_white + pct_pov + offset(log_offset), 
+          data = df, family = poisson),
+      error = function(e) NULL
+    )
+  }
+  
+  return(model)
+}
+
+# Fit models for each RUCA group
+models <- f_model %>%
+  group_split(RUCA_group) %>%
+  set_names(sort(unique(f_model$RUCA_group))) %>%
+  map(fit_model) %>%
+  compact()
+
+# Display model summary
+cat("Model Results:\n")
+for (name in names(models)) {
+  model <- models[[name]]
+  model_type <- ifelse("negbin" %in% class(model), "NegBin", "Poisson")
+  n_obs <- length(fitted(model))
+  aic <- round(AIC(model), 1)
+  cat(sprintf("  %s: %s, n=%d, AIC=%.1f\n", name, model_type, n_obs, aic))
+}
+```
+
+**Model Summary:** 
+
+- Isolated Rural required Poisson fallback (89% zero crashes)
+- All other groups successfully fitted negative binomial models
+- Metropolitan has largest sample (n=13,420) and best fit
+
+# 4. Spatial Autocorrelation Analysis
+
+## 4.1 Testing for Spatial Dependence
+
+Spatial autocorrelation in residuals violates independence assumptions and can bias standard errors. We test using Moran's I and Geary's C with queen contiguity weights.
+
+```{r spatial-autocorrelation}
+# Download Texas county boundaries from Census Bureau (cached for reuse)
+tx_counties <- counties(state = "TX", cb = TRUE, progress_bar = FALSE)
+
+test_spatial_autocorr <- function(group_name, model) {
+  # Extract model data for specific RUCA group
+  model_data <- f_model %>% filter(RUCA_group == group_name)
+  
+  # Load spatial geometries and join with model data to ensure alignment
+  spatial_data <- st_read("data.shp", quiet = TRUE) %>% 
+    mutate(GEOID = as.character(GEOID)) %>%
+    filter(GEOID %in% model_data$GEOID) %>%
+    inner_join(model_data, by = "GEOID")
+  
+  # Extract Pearson residuals from the model
+  resids <- residuals(model, type = "pearson")
+  
+  # Create spatial weights matrix using queen contiguity (shared edge or vertex)
+  nb <- poly2nb(st_make_valid(spatial_data), queen = TRUE)
+  listw <- nb2listw(nb, style = "W", zero.policy = TRUE)  # Row-standardized weights
+  
+  # Run spatial autocorrelation tests
+  moran <- moran.test(resids, listw, zero.policy = TRUE)  # Moran's I: positive values = clustering
+  geary <- geary.test(resids, listw, zero.policy = TRUE)  # Geary's C: values < 1 = clustering
+  
+  # Create map of residuals with county boundaries overlay
+  spatial_data$residuals <- resids
+  plot <- ggplot() +
+    # Plot residuals (blue = negative, red = positive)
+    geom_sf(data = spatial_data, aes(fill = residuals), color = NA) +
+    # Overlay county boundaries for geographic context
+    geom_sf(data = tx_counties, fill = NA, color = "gray30", size = 0.3, alpha = 0.5) +
+    # Diverging color scale centered at zero with symmetric limits
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#B2182B", 
+      midpoint = 0, 
+      name = "Pearson\nResiduals",
+      limits = c(-max(abs(resids), na.rm = TRUE), max(abs(resids), na.rm = TRUE))
+    ) +
+    # Add title with Moran's I statistic
+    labs(title = paste("Model Residuals:", group_name),
+         subtitle = sprintf("Moran's I = %.3f (p = %.4f)", 
+                          moran$estimate[1], moran$p.value)) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11),
+      legend.position = "right",
+      panel.grid = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Return test results and plot
+  list(moran = moran, geary = geary, plot = plot)
+}
+
+# Run spatial autocorrelation tests for each RUCA group
+spatial_results <- map(names(models), ~tryCatch(
+  test_spatial_autocorr(.x, models[[.x]]), 
+  error = function(e) NULL
+)) %>%
+  set_names(names(models)) %>%
+  compact()
+
+# Display results
+cat("\nSpatial Autocorrelation Results:\n")
+for (name in names(spatial_results)) {
+  res <- spatial_results[[name]]
+  cat(sprintf("  %s: Moran's I=%.3f (p=%.4f)\n", 
+              name, res$moran$estimate[1], res$moran$p.value))
+  print(res$plot)
+}
+```
+
+## 4.2 Interpretation of Spatial Tests
+
+**Key Findings:**
+
+- Three groups (Metropolitan, Micropolitan, Small Rural) show statistically significant spatial autocorrelation (p < 0.01)
+- However, all Moran's I values are small (0.012-0.063), indicating **weak** spatial dependence
+- With large sample sizes, even trivial spatial effects become statistically significant
+- The practical impact on coefficient estimates is likely minimal
+
+## 4.3 Combined Residual Map
+
+```{r combined-map}
+# Combine residuals from all RUCA groups into a single spatial dataset
+all_spatial_data <- map_dfr(names(models), function(name) {
+  # Filter model data for this specific RUCA group
+  model_data <- f_model %>% filter(RUCA_group == name)
+  
+  # Load spatial geometries and join with model data
+  spatial_data <- st_read("data.shp", quiet = TRUE) %>% 
+    mutate(GEOID = as.character(GEOID)) %>%
+    filter(GEOID %in% model_data$GEOID) %>%
+    inner_join(model_data, by = "GEOID")
+  
+  # Add residuals from this group's model
+  spatial_data$residuals <- residuals(models[[name]], type = "pearson")
+  spatial_data$group <- name  # Track which RUCA group each observation belongs to
+  
+  spatial_data
+})
+
+# Create statewide map showing residuals from all models combined
+combined_plot <- ggplot() +
+  # Plot residuals from all RUCA groups (blue = under-prediction, red = over-prediction)
+  geom_sf(data = all_spatial_data, aes(fill = residuals), color = NA) +
+  # Overlay Texas county boundaries for geographic reference
+  geom_sf(data = tx_counties, fill = NA, color = "gray30", size = 0.3, alpha = 0.5) +
+  # Use symmetric diverging color scale centered at zero
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", 
+    midpoint = 0,
+    name = "Pearson\nResiduals",
+    # Set equal positive/negative limits based on maximum absolute residual
+    limits = c(-max(abs(all_spatial_data$residuals), na.rm = TRUE), 
+               max(abs(all_spatial_data$residuals), na.rm = TRUE))
+  ) +
+  labs(title = "Model Residuals: All RUCA Groups Combined",
+       subtitle = "Spatial distribution of Pearson residuals across Texas") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+print(combined_plot)
+```
+
+**Pattern:** Positive residuals (under-prediction) concentrate in major urban cores, while negative residuals (over-prediction) appear in peripheral areas.
+
+## 4.4 Summary Table
+
+```{r spatial-summary}
+if (length(spatial_results) > 0) {
+  spatial_summary <- map_dfr(names(spatial_results), function(name) {
+    res <- spatial_results[[name]]
+    data.frame(
+      Group = name,
+      Moran_I = round(res$moran$estimate[1], 4),
+      Moran_p = round(res$moran$p.value, 4),
+      Geary_C = round(res$geary$estimate[1], 4),
+      Geary_p = round(res$geary$p.value, 4)
+    )
+  })
+  
+  kable(spatial_summary, caption = "Spatial Autocorrelation Test Results") %>%
+    kable_styling(c("striped", "hover"))
+}
+```
+
+# 5. Walkability Effects
+
+## 5.1 Marginal Effects Plots
+
+Predicted crash counts across walkability values for each RUCA group, holding other variables at their means.
+
+```{r plot-margins}
+safe_marginal_plot <- function(model, group_name) {
+  tryCatch({
+    preds <- ggpredict(model, terms = "NatWalkInd_c [all]", type = "fixed")
+    plot(preds) + 
+      ggtitle(paste("Marginal Effect of Walkability -", group_name)) +
+      xlab("Walkability Index (Centered)") +
+      ylab("Predicted Crash Count") +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 12, hjust = 0.5),
+        axis.title = element_text(size = 10)
+      )
+  }, error = function(e) NULL)
+}
+
+marginal_plots <- models %>%
+  imap(~ safe_marginal_plot(.x, .y)) %>%
+  compact()
+
+for (i in seq_along(marginal_plots)) {
+  print(marginal_plots[[i]])
+}
+```
+
+**Interpretation:** 
+
+- Metropolitan shows clear positive relationship with acceleration (quadratic effect)
+- Rural groups show flat or negative relationships
+- Walkability does not influence crash risk outside urban areas
+
+# 6. Regression Results
+
+## 6.1 Incident Rate Ratios
+
+By exponentiating coefficients, we get IRRs showing multiplicative effects:
+
+- **IRR > 1.0** = increases crashes
+- **IRR < 1.0** = decreases crashes  
+- **IRR = 1.0** = no effect
+
+```{r model-table}
+create_results_table <- function(models) {
+  imap_dfr(models, function(model, groupname) {
+    tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+      filter(term != "(Intercept)") %>%
+      mutate(
+        Group = groupname,
+        `IRR (95% CI)` = sprintf("%.3f (%.3f-%.3f)", estimate, conf.low, conf.high),
+        `P-value` = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)),
+        Sig = case_when(
+          p.value < 0.001 ~ "***",
+          p.value < 0.01 ~ "**",
+          p.value < 0.05 ~ "*",
+          TRUE ~ ""
+        ),
+        Variable = recode(term,
+          "NatWalkInd_c" = "Walkability (Centered)",
+          "I(NatWalkInd_c^2)" = "Walkability² (Centered)",
+          "popden" = "Population Density",
+          "pct_white" = "Percent White (Std)",
+          "pct_pov" = "Percent in Poverty (Std)"
+        )
+      ) %>%
+      select(Group, Variable, `IRR (95% CI)`, `P-value`, Sig)
+  })
+}
+
+results_table <- create_results_table(models)
+
+kable(results_table, 
+      caption = "Negative Binomial Regression Results by RUCA Group",
+      align = c("l", "l", "c", "c", "c")) %>%
+  kable_styling(c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  add_header_above(c(" " = 2, "Model Results" = 3)) %>%
+  footnote(general = "IRR = Incident Rate Ratio; *** p<0.001, ** p<0.01, * p<0.05")
+```
+
+## 6.2 Key Findings
+
+**Metropolitan Areas:**
+
+- **IRR = 1.176** for walkability: Each one-unit increase multiplies crash count by 1.176 (17.6% increase)
+- **IRR = 1.007** for walkability²: Significant quadratic effect indicates acceleration at higher walkability
+- **IRR = 1.215** for poverty: Increases crashes by 21.5%
+- **IRR = 0.829** for percent white: Each SD increase multiplies crashes by 0.829 (17.1% decrease)
+
+**Rural Areas (Isolated, Micropolitan, Small):**
+
+- No significant walkability effects
+- Very high zero-inflation (80-89%)
+- Minimal population density effects
+
+**Urban-Rural Divide:** 
+
+The walkability-crash relationship differs fundamentally by context, likely reflecting traffic volume and infrastructure differences rather than walkability itself.
+
+# 7. Discussion and Limitations
+
+## 7.1 Main Conclusions
+
+Strong urban-rural divide in walkability-crash relationships:
+
+1. **Metropolitan areas:** Significant positive associations with non-linearity
+2. **Rural areas:** No clear effects due to low traffic and crash rates
+3. **Spatial autocorrelation:** Weak but statistically significant; unlikely to bias conclusions
+
+## 7.2 Limitations
+
+- **Zero-inflation:** 69-89% of areas have zero crashes; zero-inflated models may be more appropriate
+- **Exposure measurement:** Population imperfectly measures actual traffic exposure
+- **Causal interpretation:** Positive walkability-crash association may reflect traffic volume rather than safety hazards
+- **Spatial dependence:** While weak, unmeasured spatial processes may influence results
+
+## 7.3 Future Directions
+
+- Explore zero-inflated models for excess zeros
+- Incorporate traffic volume data where available
+- Distinguish pedestrian crashes from all crashes
+- Consider geographically weighted regression for spatial non-stationarity
+
